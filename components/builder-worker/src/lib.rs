@@ -13,6 +13,9 @@
 // limitations under the License.
 
 extern crate habitat_builder_protocol as protocol;
+extern crate habitat_depot_client as depot_client;
+extern crate hab;
+extern crate habitat_common as common;
 extern crate habitat_core as hab_core;
 extern crate habitat_net as hab_net;
 extern crate git2;
@@ -32,3 +35,6 @@ pub mod vcs;
 
 pub use self::config::Config;
 pub use self::error::{Error, Result};
+
+pub const PRODUCT: &'static str = "builder-worker";
+pub const VERSION: &'static str = include_str!(concat!(env!("OUT_DIR"), "/VERSION"));

@@ -12,20 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
-use std::sync::mpsc;
+pub mod workspace;
+
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
+use depot_client;
+use hab_core::package::archive::PackageArchive;
 use hab_net::server::ZMQ_CONTEXT;
 use protobuf::{parse_from_bytes, Message};
 use protocol::jobsrv as proto;
 use zmq;
 
+use config::Config;
 use error::Result;
 use studio;
 use vcs;
+use {PRODUCT, VERSION};
 
-/// In-memory zmq address of Job Runner
+/// In-memory zmq address of Job RunnerMgr
 const INPROC_ADDR: &'static str = "inproc://runner";
 /// Protocol message to indicate the Job Runner has received a work request
 const WORK_ACK: &'static str = "A";
@@ -34,42 +39,66 @@ const WORK_COMPLETE: &'static str = "C";
 
 pub struct Runner {
     pub job: proto::Job,
-    pub workspace: PathBuf,
+    auth_token: String,
+    workspace: workspace::Workspace,
 }
 
 impl Runner {
-    pub fn new(job: proto::Job) -> Self {
-        // JW TODO: this needs to be cleaned or something maybe? Stored somewhere?
-        // Would be pretty awesome if the workspace could be shelved into S3 and then re-mounted
-        // during a run.
-        let workspace = PathBuf::from("/tmp/workspace");
+    pub fn new(job: proto::Job, config: &Config) -> Self {
         Runner {
+            auth_token: config.auth_token.clone(),
+            workspace: workspace::Workspace::new(config.data_path.clone(), &job),
             job: job,
-            workspace: workspace,
         }
     }
 
     pub fn run(&mut self) -> () {
-        // the studio should be cloning the workspace I think
-        if let Some(err) = vcs::clone(&self.job, &self.workspace).err() {
-            println!("CLONE ERROR={:?}", err);
+        if let Some(err) = self.workspace.setup().err() {
+            error!("WORKSPACE SETUP ERR={:?}", err);
             return self.fail();
         }
-        if let Some(err) = studio::build(&self.job, &self.workspace).err() {
-            println!("BUILD ERROR={:?}", err);
+        if let Some(err) = vcs::clone(&self.job, &self.workspace.path()).err() {
+            error!("CLONE ERROR={}", err);
+            return self.fail();
+        }
+        // JW TODO: studio::build should return a PackageArchive struct
+        let mut archive = match studio::build(&self.job, &self.workspace.path()) {
+            Ok(archive) => archive,
+            Err(err) => {
+                error!("STUDIO ERR={}", err);
+                return self.fail();
+            }
+        };
+        if !self.post_process(&mut archive) {
+            // JW TODO: We should shelve the built artifacts and allow a retry on post-processing.
+            // If the job is killed then we can kill the shelved artifacts.
             return self.fail();
         }
         self.complete()
     }
 
     fn complete(&mut self) -> () {
-        // clean workspace?
+        self.workspace.teardown().err().map(|e| error!("{}", e));
         self.job.set_state(proto::JobState::Complete);
     }
 
     fn fail(&mut self) -> () {
-        // clean workspace?
+        self.workspace.teardown().err().map(|e| error!("{}", e));
         self.job.set_state(proto::JobState::Failed);
+    }
+
+    fn post_process(&self, archive: &mut PackageArchive) -> bool {
+        // JW TODO: In the future we'll support multiple and configurable post processors, but for
+        // now let's just publish to the public depot
+        //
+        // Things to solve right now
+        // * Where do we get the token for authentication?
+        //      * Should the workers ask for a lease from the JobSrv?
+        let client =
+            depot_client::Client::new("https://app.habitat.sh/v1/depot", PRODUCT, VERSION, None)
+                .unwrap();
+        client.x_put_package(archive, &self.auth_token).unwrap();
+        true
     }
 }
 
@@ -134,16 +163,17 @@ impl RunnerCli {
 pub struct RunnerMgr {
     sock: zmq::Socket,
     msg: zmq::Message,
+    config: Arc<RwLock<Config>>,
 }
 
 impl RunnerMgr {
     /// Start the Job Runner
-    pub fn start() -> Result<JoinHandle<()>> {
+    pub fn start(config: Arc<RwLock<Config>>) -> Result<JoinHandle<()>> {
         let (tx, rx) = mpsc::sync_channel(0);
         let handle = thread::Builder::new()
             .name("runner".to_string())
             .spawn(move || {
-                let mut runner = Self::new().unwrap();
+                let mut runner = Self::new(config).unwrap();
                 runner.run(tx).unwrap();
             })
             .unwrap();
@@ -153,11 +183,12 @@ impl RunnerMgr {
         }
     }
 
-    fn new() -> Result<Self> {
+    fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let sock = try!((**ZMQ_CONTEXT).as_mut().socket(zmq::DEALER));
         Ok(RunnerMgr {
             sock: sock,
             msg: zmq::Message::new().unwrap(),
+            config: config,
         })
     }
 
@@ -170,11 +201,12 @@ impl RunnerMgr {
             try!(self.send_ack(&job));
             try!(self.execute_job(job));
         }
-        Ok(())
     }
 
     fn execute_job(&mut self, job: proto::Job) -> Result<()> {
-        let mut runner = Runner::new(job);
+        let mut runner = {
+            Runner::new(job, &self.config.read().unwrap())
+        };
         debug!("executing work, job={:?}", runner.job);
         runner.run();
         self.send_complete(&runner.job)

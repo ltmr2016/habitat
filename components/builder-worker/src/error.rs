@@ -28,6 +28,9 @@ pub enum Error {
     HabitatCore(hab_core::Error),
     IO(io::Error),
     Protobuf(protobuf::ProtobufError),
+    UnknownVCS,
+    WorkspaceSetup(String, io::Error),
+    WorkspaceTeardown(String, io::Error),
     Zmq(zmq::Error),
 }
 
@@ -40,7 +43,14 @@ impl fmt::Display for Error {
             Error::HabitatCore(ref e) => format!("{}", e),
             Error::IO(ref e) => format!("{}", e),
             Error::Protobuf(ref e) => format!("{}", e),
+            Error::UnknownVCS => format!("Job requires an unknown VCS"),
             Error::Zmq(ref e) => format!("{}", e),
+            Error::WorkspaceSetup(ref p, ref e) => {
+                format!("Error while setuping up workspace at {}, err={:?}", p, e)
+            }
+            Error::WorkspaceTeardown(ref p, ref e) => {
+                format!("Error while tearing down workspace at {}, err={:?}", p, e)
+            }
         };
         write!(f, "{}", msg)
     }
@@ -53,6 +63,9 @@ impl error::Error for Error {
             Error::HabitatCore(ref err) => err.description(),
             Error::IO(ref err) => err.description(),
             Error::Protobuf(ref err) => err.description(),
+            Error::UnknownVCS => "Job requires an unknown VCS",
+            Error::WorkspaceSetup(_, _) => "IO Error while creating workspace on disk",
+            Error::WorkspaceTeardown(_, _) => "IO Error while destroying workspace on disk",
             Error::Zmq(ref err) => err.description(),
         }
     }
